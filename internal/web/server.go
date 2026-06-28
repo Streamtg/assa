@@ -18,18 +18,25 @@ import (
 )
 
 type Server struct {
-	cfg      *config.Configuration
-	tgClient *gotgproto.Client
-	tgCtx    *ext.Context
-	logger   *logger.Logger
-	fs       *store.FireStore
-	router   *mux.Router
+	config         *config.Configuration
+	tgClient       *gotgproto.Client
+	tgCtx          *ext.Context
+	logger         *logger.Logger
+	fs             *store.FireStore
+	userRepository *UserRepoAdapter
+	connTracker    *ConnTracker
+	router         *mux.Router
 }
 
 func NewServer(cfg *config.Configuration, tgClient *gotgproto.Client, tgCtx *ext.Context, log *logger.Logger, fs *store.FireStore) *Server {
 	s := &Server{
-		cfg: cfg, tgClient: tgClient, tgCtx: tgCtx,
-		logger: log, fs: fs,
+		config:         cfg,
+		tgClient:       tgClient,
+		tgCtx:          tgCtx,
+		logger:         log,
+		fs:             fs,
+		userRepository: NewUserRepoAdapter(fs),
+		connTracker:    NewConnTracker(),
 	}
 	s.router = mux.NewRouter()
 	s.router.HandleFunc("/{hash}/{filename}", s.handleFile).Methods("GET", "HEAD")
@@ -38,7 +45,7 @@ func NewServer(cfg *config.Configuration, tgClient *gotgproto.Client, tgCtx *ext
 }
 
 func (s *Server) Start() {
-	addr := ":" + s.cfg.Port
+	addr := ":" + s.config.Port
 	s.logger.Infof("Web server starting on %s", addr)
 	srv := &http.Server{
 		Addr:         addr,
@@ -61,6 +68,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	hash := vars["hash"]
+	filename := vars["filename"]
 
 	ctx := r.Context()
 	mf, err := s.fs.GetMediaByHash(hash)
@@ -68,6 +76,15 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		s.logger.Printf("Lookup media failed for hash %s: %v", hash, err)
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
+	}
+	if mf == nil {
+		s.logger.Printf("Media not found for hash %s", hash)
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	if s.config.DebugMode {
+		s.logger.Debugf("File request hash=%s filename=%s stored=%s", hash, filename, mf.FileName)
 	}
 
 	chatID := mf.ChatID
@@ -83,13 +100,14 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	msg, err := s.getMessage(ctx, chatID, msgID)
 	if err != nil {
-		s.logger.Printf("Get message failed: %v", err)
+		s.logger.Printf("Get message failed for hash %s (chat=%d msg=%d): %v", hash, chatID, msgID, err)
 		http.Error(w, "Message unavailable", http.StatusInternalServerError)
 		return
 	}
 
 	tgMsg, ok := msg.(*tg.Message)
 	if !ok {
+		s.logger.Printf("Invalid message type for hash %s", hash)
 		http.Error(w, "Invalid message", http.StatusInternalServerError)
 		return
 	}
@@ -150,6 +168,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	if size > 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
+	w.Header().Set("Accept-Ranges", "bytes")
 
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
