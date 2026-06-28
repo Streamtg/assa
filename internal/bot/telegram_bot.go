@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,6 @@ import (
 	"mime"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -17,11 +17,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"webBridgeBot/internal/config"
-	"webBridgeBot/internal/data"
 	"webBridgeBot/internal/logger"
 	"webBridgeBot/internal/store"
+	"webBridgeBot/internal/tunnel"
 	"webBridgeBot/internal/types"
 	"webBridgeBot/internal/utils"
 	"webBridgeBot/internal/web"
@@ -38,13 +37,9 @@ import (
 )
 
 const (
-	cbLU         = "lu"
-	pinggyUser   = "BkPJOM3hqWT@pro.pinggy.io"
-	pinggyPort   = "443"
-	pinggyTarget = "0:127.0.0.1:8080"
-	pinggyDelay  = 10 * time.Second
-	pgSize       = 10
-	superAdmin   int64 = 8030036884
+	cbLU       = "lu"
+	pgSize     = 10
+	superAdmin int64 = 8030036884
 )
 
 var idRegex = regexp.MustCompile(`\b\d{7,15}\b`)
@@ -54,7 +49,6 @@ type TelegramBot struct {
 	tgClient *gotgproto.Client
 	tgCtx    *ext.Context
 	logger   *logger.Logger
-	userRepo *data.UserRepository
 	fs       *store.FireStore
 	webSrv   *web.Server
 	repoSess map[int64]*repoSession
@@ -90,9 +84,7 @@ func NewTelegramBot(cfg *config.Configuration, log *logger.Logger) (*TelegramBot
 	if err != nil {
 		return nil, fmt.Errorf("telegram init: %w", err)
 	}
-
 	tgCtx := tgClient.CreateContext()
-	userRepo := data.NewUserRepository(nil)
 
 	fbPath := cfg.FirebaseCredentials
 	if fbPath == "" {
@@ -108,23 +100,20 @@ func NewTelegramBot(cfg *config.Configuration, log *logger.Logger) (*TelegramBot
 	if fbPath == "" || !fileExists(fbPath) {
 		return nil, fmt.Errorf("firebase credentials not found. Set FIREBASE_CREDENTIALS in .env")
 	}
-
 	fireStore, err := store.NewFireStore(fbPath)
 	if err != nil {
 		return nil, fmt.Errorf("firestore init: %w", err)
 	}
-
 	bl, _ := fireStore.GetBlacklist()
 	if bl == nil {
 		bl = make(map[string]bool)
 	}
-
 	bot := &TelegramBot{
 		config: cfg, tgClient: tgClient, tgCtx: tgCtx,
-		logger: log, userRepo: userRepo, fs: fireStore,
+		logger: log, fs: fireStore,
 		repoSess: make(map[int64]*repoSession), blExt: bl,
 	}
-	bot.webSrv = web.NewServer(cfg, tgClient, tgCtx, log, userRepo)
+	bot.webSrv = web.NewServer(cfg, tgClient, tgCtx, log, fireStore)
 	return bot, nil
 }
 
@@ -133,24 +122,47 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func (b *TelegramBot) Run() {
+func (b *TelegramBot) Run(ctx context.Context) {
 	b.logger.Printf("Starting 𝐇𝐨𝐬𝐭 𝐖𝐚𝐯𝐞 (@%s)...", b.tgClient.Self.Username)
 	b.registerHandlers()
 	go b.webSrv.Start()
-	go b.pinggyLoop()
+	go b.runTunnel(ctx)
 	go b.cleanupLoop()
 	if err := b.tgClient.Idle(); err != nil {
 		b.logger.Fatalf("Bot failed: %s", err)
 	}
 }
 
-func (b *TelegramBot) pinggyLoop() {
+func (b *TelegramBot) runTunnel(ctx context.Context) {
+	cfg := tunnel.Config{
+		PinggyUser:           b.config.TunnelUser,
+		PinggyTarget:         b.config.TunnelTarget,
+		PinggySSHPort:        b.config.TunnelSSHPort,
+		CFAccountID:          b.config.CFAccountID,
+		CFAPIToken:           b.config.CFAPIToken,
+		CFWorkerName:         b.config.CFWorkerName,
+		CFWorkerTemplatePath: b.config.CFWorkerTemplatePath,
+		Lifetime:             b.config.TunnelLifetime,
+		MaxRetries:           b.config.TunnelMaxRetries,
+		RetryBaseDelay:       b.config.TunnelRetryBaseDelay,
+	}
+	if cfg.CFAccountID == "" || cfg.CFAPIToken == "" || cfg.CFWorkerName == "" {
+		b.logger.Printf("[tunnel] Cloudflare not configured, falling back to legacy pinggy loop")
+		b.legacyPinggyLoop()
+		return
+	}
+	if err := tunnel.Run(ctx, cfg); err != nil {
+		b.logger.Printf("[tunnel] orchestrator exited: %v", err)
+	}
+}
+
+func (b *TelegramBot) legacyPinggyLoop() {
 	for {
-		cmd := exec.Command("ssh", "-p", pinggyPort, "-R"+pinggyTarget, "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30", pinggyUser)
+		cmd := exec.Command("ssh", "-p", "443", "-R"+b.config.TunnelTarget, "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30", b.config.TunnelUser)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		_ = cmd.Run()
-		time.Sleep(pinggyDelay)
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -166,22 +178,40 @@ func (b *TelegramBot) cleanupLoop() {
 func (b *TelegramBot) registerHandlers() {
 	d := b.tgClient.Dispatcher
 	cmds := map[string]func(*ext.Context, *ext.Update) error{
-		"start": b.cmdStart, "help": b.cmdHelp,
-		"mylinks": b.cmdMyLinks, "myfiles": b.cmdMyFiles,
-		"usage": b.cmdUsage, "stats": b.cmdStats,
-		"report": b.cmdReport, "contact": b.cmdContact,
-		"authorize": b.cmdAuthorize, "deauthorize": b.cmdDeauthorize,
-		"ban": b.cmdBan, "unban": b.cmdUnban,
-		"silenceban": b.cmdSilenceBan, "unsilenceban": b.cmdUnsilenceBan,
-		"deleteuser": b.cmdDeleteUser, "warn": b.cmdWarn, "unwarn": b.cmdUnwarn,
-		"limit": b.cmdLimit, "setlimitglobal": b.cmdSetLimitGlobal,
-		"listusers": b.cmdListUsers, "userinfo": b.cmdUserInfo,
-		"broadcast": b.cmdBroadcast, "maintenance": b.cmdMaintenance,
-		"cleanup": b.cmdCleanup, "checklogs": b.cmdCheckLogs,
-		"promote": b.cmdPromote, "setexpiration": b.cmdSetExpiration,
-		"serverinfo": b.cmdServerInfo, "blacklist": b.cmdBlacklist,
-		"checkdisk": b.cmdCheckDisk, "dumpuser": b.cmdDumpUser,
-		"repo": b.cmdRepo, "addids": b.cmdAddIDs, "cleanids": b.cmdCleanIDs,
+		"start":         b.cmdStart,
+		"help":          b.cmdHelp,
+		"mylinks":       b.cmdMyLinks,
+		"myfiles":       b.cmdMyFiles,
+		"usage":         b.cmdUsage,
+		"stats":         b.cmdStats,
+		"report":        b.cmdReport,
+		"contact":       b.cmdContact,
+		"authorize":     b.cmdAuthorize,
+		"deauthorize":   b.cmdDeauthorize,
+		"ban":           b.cmdBan,
+		"unban":         b.cmdUnban,
+		"silenceban":    b.cmdSilenceBan,
+		"unsilenceban":  b.cmdUnsilenceBan,
+		"deleteuser":    b.cmdDeleteUser,
+		"warn":          b.cmdWarn,
+		"unwarn":        b.cmdUnwarn,
+		"limit":         b.cmdLimit,
+		"setlimitglobal": b.cmdSetLimitGlobal,
+		"listusers":     b.cmdListUsers,
+		"userinfo":      b.cmdUserInfo,
+		"broadcast":     b.cmdBroadcast,
+		"maintenance":   b.cmdMaintenance,
+		"cleanup":       b.cmdCleanup,
+		"checklogs":     b.cmdCheckLogs,
+		"promote":       b.cmdPromote,
+		"setexpiration": b.cmdSetExpiration,
+		"serverinfo":    b.cmdServerInfo,
+		"blacklist":     b.cmdBlacklist,
+		"checkdisk":     b.cmdCheckDisk,
+		"dumpuser":      b.cmdDumpUser,
+		"repo":          b.cmdRepo,
+		"addids":        b.cmdAddIDs,
+		"cleanids":      b.cmdCleanIDs,
 	}
 	for n, h := range cmds {
 		d.AddHandler(handlers.NewCommand(n, h))
@@ -239,7 +269,6 @@ func (b *TelegramBot) cmdStart(ctx *ext.Context, u *ext.Update) error {
 	chatID := u.EffectiveChat().GetID()
 	user := u.EffectiveUser()
 	isSA := uid == superAdmin
-
 	fu := b.getUser(uid)
 	if fu == nil {
 		n := time.Now().UTC().Format("2006-01-02 15:04:05")
@@ -258,7 +287,7 @@ func (b *TelegramBot) cmdStart(ctx *ext.Context, u *ext.Update) error {
 	} else {
 		up := map[string]interface{}{
 			"updated_at": time.Now().UTC().Format("2006-01-02 15:04:05"),
-			"chat_id": chatID, "first_name": user.FirstName,
+			"chat_id":    chatID, "first_name": user.FirstName,
 			"last_name": user.LastName, "username": user.Username,
 		}
 		if isSA && !fu.IsAdmin {
@@ -271,7 +300,6 @@ func (b *TelegramBot) cmdStart(ctx *ext.Context, u *ext.Update) error {
 		_ = b.fs.UpdateUser(uid, up)
 	}
 	_ = b.fs.TouchUser(uid)
-
 	name := user.FirstName
 	if user.Username != "" {
 		name = "@" + user.Username
@@ -280,7 +308,6 @@ func (b *TelegramBot) cmdStart(ctx *ext.Context, u *ext.Update) error {
 	if isSA {
 		role = " 👑"
 	}
-
 	return b.rpl(ctx, u, fmt.Sprintf(
 		"🌊 𝐇𝐨𝐬𝐭 𝐖𝐚𝐯𝐞\n\n"+
 			"Welcome, %s%s\n\n"+
@@ -331,7 +358,6 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 	if !ok {
 		return nil
 	}
-
 	fu := b.getUser(uid)
 	if fu == nil {
 		return b.rpl(ctx, u, "Please use /start first.")
@@ -340,12 +366,10 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 		return b.rpl(ctx, u, "Not authorized yet.")
 	}
 	_ = b.fs.TouchUser(uid)
-
 	file, err := utils.FileFromMedia(msg.Media)
 	if err != nil {
 		return b.rpl(ctx, u, fmt.Sprintf("Unsupported media: %v", err))
 	}
-
 	if file.FileName == "" || file.FileName == "file" {
 		caption := msg.Message
 		if caption != "" {
@@ -367,7 +391,6 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 			file.FileName = fmt.Sprintf("file_%d%s", time.Now().Unix(), extFromMime(file.MimeType))
 		}
 	}
-
 	fext := getFileExt(file.FileName)
 	b.blMu.RLock()
 	blocked := b.blExt[strings.ToLower(fext)]
@@ -375,12 +398,10 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 	if blocked {
 		return b.rpl(ctx, u, fmt.Sprintf("🚫 %s files not allowed.", fext))
 	}
-
 	lim := b.getLimit(uid)
 	if lim > 0 && file.FileSize > int64(lim)*1024*1024 {
 		return b.rpl(ctx, u, fmt.Sprintf("🚫 Limit: %d MB. Your file: %s.", lim, hBytes(file.FileSize)))
 	}
-
 	origID := msg.ID
 	logID := 0
 	if b.config.LogChannelID != "" && b.config.LogChannelID != "0" {
@@ -388,7 +409,6 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 			logID = id
 		}
 	}
-
 	var chURL int64
 	var msgURL int
 	if logID > 0 {
@@ -398,8 +418,11 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 		chURL = chatID
 		msgURL = origID
 	}
-	fileURL := b.genURL(chURL, msgURL, file)
+	// Note: chURL and msgURL are kept for storage but no longer used in URL generation
+	_ = chURL
+	_ = msgURL
 
+	fileURL := b.genURL(file)
 	pid := genPubID(uid, origID, file.ID)
 	h := utils.GetShortHash(utils.PackFile(file.FileName, file.FileSize, file.MimeType, file.ID), b.config.HashLength)
 	mf := &store.MediaFile{
@@ -413,7 +436,6 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 	if err := b.fs.SaveMedia(mf); err != nil {
 		b.logger.Printf("SaveMedia error: %v", err)
 	}
-
 	if fu != nil {
 		_ = b.fs.UpdateUser(uid, map[string]interface{}{
 			"total_files": fu.TotalFiles + 1,
@@ -421,11 +443,9 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 		})
 	}
 	b.fs.LogActivity(uid, "upload", file.FileName)
-
 	if logID > 0 {
 		go b.sendAudit(mf)
 	}
-
 	b.repoMu.Lock()
 	if sess, ok := b.repoSess[uid]; ok {
 		sess.Files = append(sess.Files, repoFile{
@@ -439,7 +459,6 @@ func (b *TelegramBot) handleMedia(ctx *ext.Context, u *ext.Update) error {
 	} else {
 		b.repoMu.Unlock()
 	}
-
 	return b.sendCard(ctx, u, fileURL, file)
 }
 
@@ -472,7 +491,6 @@ func (b *TelegramBot) cmdMyLinks(ctx *ext.Context, u *ext.Update) error {
 	if !ok {
 		return nil
 	}
-
 	args := strings.Fields(u.EffectiveMessage.Text)
 	page := 1
 	if len(args) > 1 {
@@ -480,23 +498,19 @@ func (b *TelegramBot) cmdMyLinks(ctx *ext.Context, u *ext.Update) error {
 			page = p
 		}
 	}
-
 	off := (page - 1) * pgSize
 	items, total, err := b.fs.GetUserMedia(uid, off, pgSize)
 	if err != nil {
 		b.logger.Printf("GetUserMedia error: %v", err)
 		return b.rpl(ctx, u, "❌ Error retrieving your links.")
 	}
-
 	if total == 0 {
 		return b.rpl(ctx, u, "📁 No files yet.\nSend any file to generate a streaming link.")
 	}
-
 	pg := page
 	tp := int((total + int64(pgSize) - 1) / int64(pgSize))
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("🌊 𝐇𝐨𝐬𝐭 𝐖𝐚𝐯𝐞  Your Links\n\n📊 Total: %d files\n\n", total))
-
 	for _, m := range items {
 		fn := m.FileName
 		if len(fn) > 50 {
@@ -521,27 +535,21 @@ func (b *TelegramBot) cmdMyLinks(ctx *ext.Context, u *ext.Update) error {
 		}
 		sb.WriteString(fmt.Sprintf("   🔗 %s\n\n", m.PublicURL))
 	}
-
 	sb.WriteString(fmt.Sprintf("━━━━━━━━━━━━━━━━━━━━\nPage %d/%d", pg, tp))
 	if tp > 1 {
 		sb.WriteString(fmt.Sprintf("  |  /mylinks %d for next page", pg+1))
 	}
-
 	return b.rpl(ctx, u, sb.String())
 }
-
-// ─── /myfiles — CORREGIDO: Reenvía archivos SIN enlaces ─────────────────────────
 
 func (b *TelegramBot) cmdMyFiles(ctx *ext.Context, u *ext.Update) error {
 	uid, ok := b.access(ctx, u)
 	if !ok {
 		return nil
 	}
-
 	if b.config.LogChannelID == "" || b.config.LogChannelID == "0" {
 		return b.rpl(ctx, u, "❌ Log channel not configured.")
 	}
-
 	args := strings.Fields(u.EffectiveMessage.Text)
 	page := 1
 	if len(args) > 1 {
@@ -549,26 +557,20 @@ func (b *TelegramBot) cmdMyFiles(ctx *ext.Context, u *ext.Update) error {
 			page = p
 		}
 	}
-
 	off := (page - 1) * pgSize
 	items, total, err := b.fs.GetUserMedia(uid, off, pgSize)
 	if err != nil {
 		b.logger.Printf("GetUserMedia error: %v", err)
 		return b.rpl(ctx, u, "❌ Error retrieving your files.")
 	}
-
 	if total == 0 {
 		return b.rpl(ctx, u, "📂 No files found in log channel.\nSend files to generate links.")
 	}
-
 	pg := page
 	tp := int((total + int64(pgSize) - 1) / int64(pgSize))
-
 	_ = b.rpl(ctx, u, fmt.Sprintf("📂 𝐇𝐨𝐬𝐭 𝐖𝐚𝐯𝐞  Your Files (Page %d/%d)\n\n📊 Total: %d files\n\nReceiving files now...", pg, tp, total))
-
 	for _, m := range items {
 		if m.LogMessageID <= 0 || m.LogChannelID == "" {
-			// Si no hay log, enviar solo el enlace como fallback
 			fn := m.FileName
 			if len(fn) > 50 {
 				fn = fn[:47] + "..."
@@ -581,12 +583,9 @@ func (b *TelegramBot) cmdMyFiles(ctx *ext.Context, u *ext.Update) error {
 			time.Sleep(300 * time.Millisecond)
 			continue
 		}
-
-		// Reenviar el archivo desde el log channel
 		err := b.forwardFileFromLog(ctx, u, &m)
 		if err != nil {
 			b.logger.Printf("ForwardFileFromLog error: %v", err)
-			// Fallback: enviar solo el enlace
 			fn := m.FileName
 			if len(fn) > 50 {
 				fn = fn[:47] + "..."
@@ -599,30 +598,21 @@ func (b *TelegramBot) cmdMyFiles(ctx *ext.Context, u *ext.Update) error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-
 	if tp > 1 {
 		_ = b.rpl(ctx, u, fmt.Sprintf("━━━━━━━━━━━━━━━━━━━━\nPage %d/%d\n/myfiles %d for next page", pg, tp, pg+1))
 	}
-
 	return nil
 }
 
-// ─── forwardFileFromLog — CORREGIDO: Forward directo sin GetMessages ────────────
 func (b *TelegramBot) forwardFileFromLog(ctx *ext.Context, u *ext.Update, m *store.MediaFile) error {
-	// Obtener el peer del log channel con AccessHash correcto
 	logPeer, err := b.logChPeer()
 	if err != nil {
 		return fmt.Errorf("logChPeer error: %w", err)
 	}
-
-	// Obtener el chat del usuario
 	userPeer := ctx.PeerStorage.GetInputPeerById(u.EffectiveChat().GetID())
 	if userPeer == nil {
 		return fmt.Errorf("user peer not found")
 	}
-
-	// CORREGIDO: ForwardMessages directo sin llamar a GetMessages primero
-	// Esto funciona porque el bot tiene acceso al canal (es admin)
 	_, err = ctx.Raw.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
 		FromPeer: logPeer,
 		ToPeer:   userPeer,
@@ -633,8 +623,6 @@ func (b *TelegramBot) forwardFileFromLog(ctx *ext.Context, u *ext.Update, m *sto
 	if err != nil {
 		return fmt.Errorf("forward error: %w", err)
 	}
-
-	// Enviar el enlace generado debajo del archivo (opcional, se puede quitar)
 	date := m.CreatedAt
 	if len(date) > 10 {
 		date = date[:10]
@@ -643,9 +631,7 @@ func (b *TelegramBot) forwardFileFromLog(ctx *ext.Context, u *ext.Update, m *sto
 	if len(fn) > 50 {
 		fn = fn[:47] + "..."
 	}
-
 	_ = b.rpl(ctx, u, fmt.Sprintf("📅 %s | 📄 %s\n🔗 %s\n", date, fn, m.PublicURL))
-
 	return nil
 }
 
@@ -710,12 +696,10 @@ func (b *TelegramBot) cmdAddIDs(ctx *ext.Context, u *ext.Update) error {
 		return b.rpl(ctx, u, "Usage: /addids <ID or paste text with IDs>")
 	}
 	text := raw[idx+1:]
-
 	matches := idRegex.FindAllString(text, -1)
 	if len(matches) == 0 {
 		return b.rpl(ctx, u, "No IDs found. IDs must be 7-15 digit numbers.")
 	}
-
 	seen := make(map[int64]bool)
 	var ids []int64
 	for _, m := range matches {
@@ -731,14 +715,11 @@ func (b *TelegramBot) cmdAddIDs(ctx *ext.Context, u *ext.Update) error {
 	if len(ids) == 0 {
 		return b.rpl(ctx, u, "No valid IDs found.")
 	}
-
 	_ = b.rpl(ctx, u, fmt.Sprintf("🔍 Verifying %d IDs against Telegram...", len(ids)))
-
 	added := 0
 	existed := 0
 	invalid := 0
 	n := time.Now().UTC().Format("2006-01-02 15:04:05")
-
 	for _, id := range ids {
 		existing := b.getUser(id)
 		if existing != nil {
@@ -748,20 +729,17 @@ func (b *TelegramBot) cmdAddIDs(ctx *ext.Context, u *ext.Update) error {
 			existed++
 			continue
 		}
-
 		inputUser := &tg.InputUser{UserID: id, AccessHash: 0}
 		userResult, err := b.tgClient.API().UsersGetUsers(b.tgCtx, []tg.InputUserClass{inputUser})
 		if err != nil || len(userResult) == 0 {
 			invalid++
 			continue
 		}
-
 		tgUser, ok := userResult[0].(*tg.User)
 		if !ok || tgUser == nil || tgUser.ID == 0 {
 			invalid++
 			continue
 		}
-
 		newUser := &store.User{
 			UserID: tgUser.ID, ChatID: tgUser.ID,
 			FirstName: tgUser.FirstName, LastName: tgUser.LastName,
@@ -776,7 +754,6 @@ func (b *TelegramBot) cmdAddIDs(ctx *ext.Context, u *ext.Update) error {
 		added++
 		time.Sleep(200 * time.Millisecond)
 	}
-
 	b.fs.LogActivity(u.EffectiveUser().ID, "addids", fmt.Sprintf("added=%d existed=%d invalid=%d", added, existed, invalid))
 	return b.rpl(ctx, u, fmt.Sprintf("✅ Verification Complete\n\n🆔 IDs checked: %d\n➕ Added: %d\n📋 Already existed: %d\n❌ Not valid: %d", len(ids), added, existed, invalid))
 }
@@ -785,31 +762,24 @@ func (b *TelegramBot) cmdCleanIDs(ctx *ext.Context, u *ext.Update) error {
 	if !b.isAdm(u.EffectiveUser().ID) {
 		return b.rpl(ctx, u, "🚫 Admin only.")
 	}
-
 	_ = b.rpl(ctx, u, "🔍 Verifying all users in database...")
-
 	allUsers, err := b.fs.ExportAllUsers()
 	if err != nil {
 		return b.rpl(ctx, u, fmt.Sprintf("❌ Error loading users: %v", err))
 	}
-
 	if len(allUsers) == 0 {
 		return b.rpl(ctx, u, "No users in database.")
 	}
-
 	valid := 0
 	removed := 0
 	total := len(allUsers)
-
 	for i, usr := range allUsers {
 		if usr.UserID == superAdmin || usr.UserID == b.tgClient.Self.ID {
 			valid++
 			continue
 		}
-
 		inputUser := &tg.InputUser{UserID: usr.UserID, AccessHash: 0}
 		result, err := b.tgClient.API().UsersGetUsers(b.tgCtx, []tg.InputUserClass{inputUser})
-
 		isValid := false
 		if err == nil && len(result) > 0 {
 			if tgUser, ok := result[0].(*tg.User); ok && tgUser != nil && tgUser.ID != 0 {
@@ -823,20 +793,17 @@ func (b *TelegramBot) cmdCleanIDs(ctx *ext.Context, u *ext.Update) error {
 				}
 			}
 		}
-
 		if isValid {
 			valid++
 		} else {
 			_ = b.fs.DeleteUser(usr.UserID)
 			removed++
 		}
-
 		if (i+1)%25 == 0 {
 			_ = b.rpl(ctx, u, fmt.Sprintf("⏳ Progress: %d/%d checked...", i+1, total))
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-
 	b.fs.LogActivity(u.EffectiveUser().ID, "cleanids", fmt.Sprintf("valid=%d removed=%d total=%d", valid, removed, total))
 	return b.rpl(ctx, u, fmt.Sprintf("✅ Cleanup Complete\n\n🆔 Checked: %d\n✅ Valid: %d\n🗑️ Removed: %d", total, valid, removed))
 }
@@ -1057,23 +1024,19 @@ func (b *TelegramBot) cmdBroadcast(ctx *ext.Context, u *ext.Update) error {
 		return b.rpl(ctx, u, "Usage: /broadcast <message>")
 	}
 	message := raw[idx+1:]
-
 	users, err := b.fs.GetBroadcastUsers(true)
 	if err != nil {
 		return b.rpl(ctx, u, fmt.Sprintf("❌ Error getting users: %v", err))
 	}
-
 	if len(users) == 0 {
 		return b.rpl(ctx, u, "No users to broadcast to.")
 	}
-
 	go func() {
 		sent, fail := 0, 0
 		for _, usr := range users {
 			if usr.UserID == b.tgClient.Self.ID || usr.UserID == superAdmin {
 				continue
 			}
-
 			err := b.sendDM(usr.ChatID, message)
 			if err != nil {
 				b.logger.Printf("Broadcast fail to %d: %v", usr.UserID, err)
@@ -1085,7 +1048,6 @@ func (b *TelegramBot) cmdBroadcast(ctx *ext.Context, u *ext.Update) error {
 		}
 		_ = b.sendDM(u.EffectiveChat().GetID(), fmt.Sprintf("📣 Broadcast Done\n\n✅ Sent: %d\n❌ Failed: %d\n📊 Total: %d", sent, fail, len(users)))
 	}()
-
 	return b.rpl(ctx, u, fmt.Sprintf("📣 Broadcasting to %d users...", len(users)))
 }
 
@@ -1359,9 +1321,7 @@ func (b *TelegramBot) handleCB(ctx *ext.Context, u *ext.Update) error {
 	if len(parts) < 2 {
 		return b.ackCB(ctx, u, "OK")
 	}
-
 	chatID := u.CallbackQuery.UserID
-
 	switch parts[0] {
 	case cbLU:
 		pg, _ := strconv.Atoi(parts[1])
@@ -1469,20 +1429,11 @@ func (b *TelegramBot) sendAudit(m *store.MediaFile) {
 	})
 }
 
-func (b *TelegramBot) genURL(chID int64, msgID int, file *types.DocumentFile) string {
+func (b *TelegramBot) genURL(file *types.DocumentFile) string {
 	h := utils.GetShortHash(utils.PackFile(file.FileName, file.FileSize, file.MimeType, file.ID), b.config.HashLength)
-	p := url.Values{}
-	p.Set("ch", strconv.FormatInt(chID, 10))
-	if file.FileName != "" {
-		p.Set("fn", file.FileName)
-	}
-	if file.MimeType != "" {
-		p.Set("mt", file.MimeType)
-	}
-	if file.FileSize > 0 {
-		p.Set("fs", strconv.FormatInt(file.FileSize, 10))
-	}
-	return fmt.Sprintf("%s/%d/%s?%s", strings.TrimRight(b.config.BaseURL, "/"), msgID, h, p.Encode())
+	base := strings.TrimRight(b.config.BaseURL, "/")
+	encName := url.QueryEscape(file.FileName)
+	return fmt.Sprintf("%s/%s/%s", base, h, encName)
 }
 
 func (b *TelegramBot) isUserChat(ctx *ext.Context, cid int64) bool {
@@ -1499,7 +1450,6 @@ func (b *TelegramBot) sendDM(chatID int64, msg string) error {
 		UserID:     chatID,
 		AccessHash: 0,
 	}
-
 	_, err := b.tgCtx.Raw.MessagesSendMessage(b.tgCtx, &tg.MessagesSendMessageRequest{
 		Peer:     peer,
 		Message:  msg,
@@ -1699,101 +1649,101 @@ func sortFiles(f []repoFile, by string) {
 
 func mimeMap() map[string]string {
 	return map[string]string{
-		".apk":  "application/vnd.android.package-archive",
-		".apks": "application/vnd.android.package-archive",
-		".xapk": "application/vnd.android.package-archive",
-		".aab":  "application/vnd.android.aab",
-		".mp4":  "video/mp4",
-		".mkv":  "video/x-matroska",
-		".mov":  "video/quicktime",
-		".avi":  "video/x-msvideo",
-		".webm": "video/webm",
-		".flv":  "video/x-flv",
-		".wmv":  "video/x-ms-wmv",
-		".m4v":  "video/x-m4v",
-		".3gp":  "video/3gpp",
-		".3g2":  "video/3gpp2",
-		".mpeg": "video/mpeg",
-		".mpg":  "video/mpeg",
-		".ts":   "video/mp2t",
-		".mts":  "video/mp2t",
-		".vob":  "video/dvd",
-		".ogv":  "video/ogg",
-		".mp3":  "audio/mpeg",
-		".m4a":  "audio/mp4",
-		".wav":  "audio/wav",
-		".ogg":  "audio/ogg",
-		".flac": "audio/flac",
-		".aac":  "audio/aac",
-		".wma":  "audio/x-ms-wma",
-		".amr":  "audio/amr",
-		".opus": "audio/opus",
-		".jpg":  "image/jpeg",
-		".jpeg": "image/jpeg",
-		".png":  "image/png",
-		".gif":  "image/gif",
-		".webp": "image/webp",
-		".bmp":  "image/bmp",
-		".tiff": "image/tiff",
-		".tif":  "image/tiff",
-		".ico":  "image/x-icon",
-		".svg":  "image/svg+xml",
-		".heic": "image/heic",
-		".heif": "image/heif",
-		".pdf":  "application/pdf",
-		".txt":  "text/plain",
-		".csv":  "text/csv",
-		".json": "application/json",
-		".xml":  "application/xml",
-		".html": "text/html",
-		".htm":  "text/html",
-		".doc":  "application/msword",
-		".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-		".xls":  "application/vnd.ms-excel",
-		".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		".ppt":  "application/vnd.ms-powerpoint",
-		".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-		".odt":  "application/vnd.oasis.opendocument.text",
-		".ods":  "application/vnd.oasis.opendocument.spreadsheet",
-		".odp":  "application/vnd.oasis.opendocument.presentation",
-		".rtf":  "application/rtf",
-		".zip":  "application/zip",
-		".rar":  "application/vnd.rar",
-		".7z":   "application/x-7z-compressed",
-		".tar":  "application/x-tar",
-		".gz":   "application/gzip",
-		".bz2":  "application/x-bzip2",
-		".xz":   "application/x-xz",
-		".iso":  "application/x-iso9660-image",
-		".dmg":  "application/x-apple-diskimage",
-		".exe":  "application/x-msdownload",
-		".msi":  "application/x-msdownload",
-		".deb":  "application/vnd.debian.binary-package",
-		".rpm":  "application/x-rpm",
-		".bin":  "application/octet-stream",
-		".sh":   "application/x-sh",
-		".py":   "text/x-python",
-		".js":   "application/javascript",
-		".tsx":  "application/typescript",
-		".java": "text/x-java",
-		".c":    "text/x-c",
-		".cpp":  "text/x-c++src",
-		".go":   "text/x-go",
-		".rs":   "text/x-rust",
-		".php":  "application/x-php",
-		".rb":   "text/x-ruby",
+		".apk":   "application/vnd.android.package-archive",
+		".apks":  "application/vnd.android.package-archive",
+		".xapk":  "application/vnd.android.package-archive",
+		".aab":   "application/vnd.android.aab",
+		".mp4":   "video/mp4",
+		".mkv":   "video/x-matroska",
+		".mov":   "video/quicktime",
+		".avi":   "video/x-msvideo",
+		".webm":  "video/webm",
+		".flv":   "video/x-flv",
+		".wmv":   "video/x-ms-wmv",
+		".m4v":   "video/x-m4v",
+		".3gp":   "video/3gpp",
+		".3g2":   "video/3gpp2",
+		".mpeg":  "video/mpeg",
+		".mpg":   "video/mpeg",
+		".ts":    "video/mp2t",
+		".mts":   "video/mp2t",
+		".vob":   "video/dvd",
+		".ogv":   "video/ogg",
+		".mp3":   "audio/mpeg",
+		".m4a":   "audio/mp4",
+		".wav":   "audio/wav",
+		".ogg":   "audio/ogg",
+		".flac":  "audio/flac",
+		".aac":   "audio/aac",
+		".wma":   "audio/x-ms-wma",
+		".amr":   "audio/amr",
+		".opus":  "audio/opus",
+		".jpg":   "image/jpeg",
+		".jpeg":  "image/jpeg",
+		".png":   "image/png",
+		".gif":   "image/gif",
+		".webp":  "image/webp",
+		".bmp":   "image/bmp",
+		".tiff":  "image/tiff",
+		".tif":   "image/tiff",
+		".ico":   "image/x-icon",
+		".svg":   "image/svg+xml",
+		".heic":  "image/heic",
+		".heif":  "image/heif",
+		".pdf":   "application/pdf",
+		".txt":   "text/plain",
+		".csv":   "text/csv",
+		".json":  "application/json",
+		".xml":   "application/xml",
+		".html":  "text/html",
+		".htm":   "text/html",
+		".doc":   "application/msword",
+		".docx":  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		".xls":   "application/vnd.ms-excel",
+		".xlsx":  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		".ppt":   "application/vnd.ms-powerpoint",
+		".pptx":  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		".odt":   "application/vnd.oasis.opendocument.text",
+		".ods":   "application/vnd.oasis.opendocument.spreadsheet",
+		".odp":   "application/vnd.oasis.opendocument.presentation",
+		".rtf":   "application/rtf",
+		".zip":   "application/zip",
+		".rar":   "application/vnd.rar",
+		".7z":    "application/x-7z-compressed",
+		".tar":   "application/x-tar",
+		".gz":    "application/gzip",
+		".bz2":   "application/x-bzip2",
+		".xz":    "application/x-xz",
+		".iso":   "application/x-iso9660-image",
+		".dmg":   "application/x-apple-diskimage",
+		".exe":   "application/x-msdownload",
+		".msi":   "application/x-msdownload",
+		".deb":   "application/vnd.debian.binary-package",
+		".rpm":   "application/x-rpm",
+		".bin":   "application/octet-stream",
+		".sh":    "application/x-sh",
+		".py":    "text/x-python",
+		".js":    "application/javascript",
+		".tsx":   "application/typescript",
+		".java":  "text/x-java",
+		".c":     "text/x-c",
+		".cpp":   "text/x-c++src",
+		".go":    "text/x-go",
+		".rs":    "text/x-rust",
+		".php":   "application/x-php",
+		".rb":    "text/x-ruby",
 		".swift": "text/x-swift",
-		".kt":   "text/x-kotlin",
-		".sql":  "application/sql",
-		".yaml": "application/x-yaml",
-		".yml":  "application/x-yaml",
-		".toml": "application/x-toml",
-		".ttf":  "font/ttf",
-		".otf":  "font/otf",
-		".woff": "font/woff",
+		".kt":    "text/x-kotlin",
+		".sql":   "application/sql",
+		".yaml":  "application/x-yaml",
+		".yml":   "application/x-yaml",
+		".toml":  "application/x-toml",
+		".ttf":   "font/ttf",
+		".otf":   "font/otf",
+		".woff":  "font/woff",
 		".woff2": "font/woff2",
-		".log":  "text/plain",
-		".md":   "text/markdown",
+		".log":   "text/plain",
+		".md":    "text/markdown",
 	}
 }
 
