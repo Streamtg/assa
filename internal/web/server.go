@@ -25,6 +25,7 @@ type Server struct {
 	fs             *store.FireStore
 	userRepository *UserRepoAdapter
 	connTracker    *ConnTracker
+	wsManager      *WSManager
 	router         *mux.Router
 }
 
@@ -37,10 +38,26 @@ func NewServer(cfg *config.Configuration, tgClient *gotgproto.Client, tgCtx *ext
 		fs:             fs,
 		userRepository: NewUserRepoAdapter(fs),
 		connTracker:    NewConnTracker(),
+		wsManager:      NewWSManager(),
 	}
 	s.router = mux.NewRouter()
 	s.router.HandleFunc("/{hash}/{filename}", s.handleFile).Methods("GET", "HEAD")
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
+
+	// Additional routes expected by handlers.go
+	s.router.HandleFunc("/player/{chatID}", s.handlePlayer).Methods("GET")
+	s.router.HandleFunc("/avatar/{chatID}", s.handleAvatar).Methods("GET")
+	s.router.HandleFunc("/proxy", s.handleProxy).Methods("GET")
+	s.router.HandleFunc("/validate-user/{chatID}", s.handleValidateUser).Methods("GET")
+	s.router.HandleFunc("/connection-stats/{chatID}", s.handleConnectionStats).Methods("GET")
+	s.router.HandleFunc("/favicon.ico", s.handleFavicon).Methods("GET")
+	s.router.HandleFunc("/robots.txt", s.handleRobots).Methods("GET")
+	s.router.HandleFunc("/sitemap.xml", s.handleSitemap).Methods("GET")
+	s.router.HandleFunc("/.well-known/{path}", s.handleWellKnown).Methods("GET")
+	s.router.HandleFunc("/metrics", s.handleMetrics).Methods("GET")
+	s.router.HandleFunc("/login", s.handleLogin).Methods("GET")
+	s.router.HandleFunc("/ws", s.wsManager.ServeHTTP)
+
 	return s
 }
 
@@ -181,7 +198,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		chunk, err := s.tgClient.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
 			Location: loc,
 			Offset:   offset,
-			Limit:    int32(limit),
+			Limit:    int(limit),
 		})
 		if err != nil {
 			s.logger.Printf("UploadGetFile error at offset %d: %v", offset, err)
@@ -199,7 +216,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 			if offset >= size && size > 0 {
 				return
 			}
-		case *tg.UploadFileCdnRedirect:
+		case *tg.UploadFileCDNRedirect:
 			http.Error(w, "CDN redirect not supported", http.StatusInternalServerError)
 			return
 		default:
@@ -248,7 +265,7 @@ func (s *Server) getMessage(ctx context.Context, chatID int64, msgID int) (tg.Me
 		return nil, fmt.Errorf("message not found in channel response")
 	}
 
-	res, err := s.tgCtx.Raw.MessagesGetMessages(ctx, &tg.MessagesGetMessagesRequest{ID: inputMsg})
+	res, err := s.tgCtx.Raw.MessagesGetMessages(ctx, inputMsg)
 	if err != nil {
 		return nil, err
 	}
