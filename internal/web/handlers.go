@@ -7,8 +7,11 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
+	"webBridgeBot/internal/utils"
 	"github.com/gorilla/mux"
 	"github.com/gotd/td/tg"
 )
@@ -148,17 +151,18 @@ func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
 	if sizeBytes <= 0 {
 		sizeBytes = 256 * 1024
 	}
-	loc := &tg.InputPhotoFileLocation{
+	// loc and start are prepared for future Telegram reader integration
+	_ = &tg.InputPhotoFileLocation{
 		ID: photo.ID, AccessHash: photo.AccessHash,
 		FileReference: photo.FileReference, ThumbSize: thumbType,
 	}
-	start := int64(0)
+	_ = int64(0)
 	end := int64(sizeBytes - 1)
 	if end < 0 {
 		end = 0
 	}
+	_ = end
 
-	// Use the existing Telegram reader if available, otherwise fallback simple
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	if sizeBytes > 0 {
