@@ -6,42 +6,32 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 	"webBridgeBot/internal/bot"
-	"webBridgeBot/internal/config" // Import config package
+	"webBridgeBot/internal/config"
 	"webBridgeBot/internal/logger"
-
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper" // Import viper for BindPFlags
+	"github.com/spf13/viper"
 )
 
-// cfg is declared at the package level to allow Cobra to bind flags directly to its fields.
 var cfg config.Configuration
-
-// envFilePath stores the custom .env file path if provided
 var envFilePath string
 
 func main() {
-	// Create an initial logger for startup (will be reconfigured after config loads)
 	log := logger.NewDefault("webBridgeBot: ")
 
 	rootCmd := &cobra.Command{
 		Use:   "webBridgeBot",
 		Short: "WebBridgeBot",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			// 1. Initialize Viper: Read from environment variables and .env file.
-			// This is called after flags are parsed, so envFilePath is now available.
 			config.InitializeViper(log, envFilePath)
 			return viper.BindPFlags(cmd.Flags())
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			// 3. Load final configuration (which now also initializes the cache).
 			cfg = config.LoadConfig(log)
-
-			// Update logger level based on loaded configuration
 			log.SetLevel(logger.ParseLogLevel(cfg.LogLevel))
 			log.Infof("Log level set to: %s", cfg.LogLevel)
 
-			// The BinaryCache now has a background worker. We must ensure it's closed properly.
 			defer func() {
 				log.Info("Closing binary cache...")
 				if err := cfg.BinaryCache.Close(); err != nil {
@@ -54,27 +44,20 @@ func main() {
 				log.Fatalf("Error initializing Telegram bot: %v", err)
 			}
 
-			// Setup graceful shutdown
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
-			// Run the bot in a separate goroutine so we can listen for shutdown signals.
 			go func() {
-				b.Run()
-				// If b.Run() returns (e.g., due to an unrecoverable error),
-				// we signal the main function to stop.
+				b.Run(ctx)
 				stop()
 			}()
 
 			log.Info("Bot is running. Press Ctrl+C to exit.")
-			<-ctx.Done() // Block here until a signal is received
-
+			<-ctx.Done()
 			log.Info("Shutdown signal received, initiating graceful shutdown...")
-			// The deferred cache close will now be executed.
 		},
 	}
 
-	// 4. Define Cobra flags:
 	rootCmd.Flags().StringVar(&envFilePath, "env_file", "", "Path to .env file (default: searches in executable directory and current directory)")
 	rootCmd.Flags().IntVar(&cfg.ApiID, "api_id", 0, "Telegram API ID (required)")
 	rootCmd.Flags().StringVar(&cfg.ApiHash, "api_hash", "", "Telegram API Hash (required)")
@@ -87,6 +70,16 @@ func main() {
 	rootCmd.Flags().BoolVar(&cfg.DebugMode, "debug_mode", false, "Enable debug logging (default false)")
 	rootCmd.Flags().StringVar(&cfg.LogLevel, "log_level", "INFO", "Log level: DEBUG, INFO, WARNING, ERROR (default INFO, or DEBUG if debug_mode=true)")
 	rootCmd.Flags().StringVar(&cfg.LogChannelID, "log_channel_id", "0", "Optional: Telegram Channel ID or @username to forward all media to (for logging)")
+	rootCmd.Flags().StringVar(&cfg.TunnelUser, "tunnel_user", "BkPJOM3hqWT@pro.pinggy.io", "Pinggy SSH user")
+	rootCmd.Flags().StringVar(&cfg.TunnelTarget, "tunnel_target", "0:127.0.0.1:8080", "Pinggy remote target")
+	rootCmd.Flags().IntVar(&cfg.TunnelSSHPort, "tunnel_ssh_port", 443, "Pinggy SSH port")
+	rootCmd.Flags().DurationVar(&cfg.TunnelLifetime, "tunnel_lifetime", 60*time.Minute, "Tunnel renewal interval")
+	rootCmd.Flags().IntVar(&cfg.TunnelMaxRetries, "tunnel_max_retries", 10, "Max retries on tunnel failure")
+	rootCmd.Flags().DurationVar(&cfg.TunnelRetryBaseDelay, "tunnel_retry_base_delay", 2*time.Second, "Base delay for tunnel backoff")
+	rootCmd.Flags().StringVar(&cfg.CFAccountID, "cf_account_id", "", "Cloudflare Account ID")
+	rootCmd.Flags().StringVar(&cfg.CFAPIToken, "cf_api_token", "", "Cloudflare API Token")
+	rootCmd.Flags().StringVar(&cfg.CFWorkerName, "cf_worker_name", "", "Cloudflare Worker script name")
+	rootCmd.Flags().StringVar(&cfg.CFWorkerTemplatePath, "cf_worker_template", "", "Path to Cloudflare Worker template (optional)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
