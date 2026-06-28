@@ -48,11 +48,9 @@ func (wm *WebSocketManager) PublishMessage(chatID int64, message map[string]stri
 	if client, ok := wm.clients[chatID]; ok {
 		messageJSON, err := json.Marshal(message)
 		if err != nil {
-			// Silently fail on marshalling error
 			return
 		}
 		if err := client.WriteMessage(websocket.TextMessage, messageJSON); err != nil {
-			// Remove client if write fails
 			delete(wm.clients, chatID)
 			client.Close()
 		}
@@ -68,11 +66,9 @@ func (wm *WebSocketManager) PublishControlCommand(chatID int64, command string, 
 		}
 		messageJSON, err := json.Marshal(msg)
 		if err != nil {
-			// Silently fail on marshalling error
 			return
 		}
 		if err := client.WriteMessage(websocket.TextMessage, messageJSON); err != nil {
-			// Remove client if write fails
 			delete(wm.clients, chatID)
 			client.Close()
 		}
@@ -89,14 +85,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-
 	if s.config.DebugMode {
 		s.logger.Debugf("WebSocket connection attempt from %s for chat ID %d", r.RemoteAddr, chatID)
 	}
 
-	// Authorize user based on chatID (assuming chatID from URL is the user's ID in private chat)
 	userInfo, err := s.userRepository.GetUserInfo(chatID)
-	if err != nil || !userInfo.IsAuthorized {
+	if err != nil || userInfo == nil || !userInfo.IsAuthorized {
 		http.Error(w, "Unauthorized WebSocket connection: User not found or not authorized.", http.StatusUnauthorized)
 		s.logger.Printf("Unauthorized WebSocket connection attempt for chatID %d: User not found or not authorized (%v)", chatID, err)
 		if s.config.DebugMode {
@@ -116,7 +110,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Infof("WebSocket client connected for chat ID: %d", chatID)
 
 	for {
-		// Keep the connection alive or handle control messages.
 		messageType, p, err := ws.ReadMessage()
 		if err != nil {
 			if s.config.DebugMode {
@@ -125,7 +118,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			s.wsManager.RemoveClient(chatID)
 			break
 		}
-		// Echo the message back (optional, for keeping the connection alive).
 		if err := ws.WriteMessage(messageType, p); err != nil {
 			if s.config.DebugMode {
 				s.logger.Debugf("WebSocket write error: %v", err)
@@ -140,7 +132,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func parseChatID(vars map[string]string) (int64, error) {
 	chatIDStr, ok := vars["chatID"]
 	if !ok {
-		return 0, http.ErrMissingFile // Reusing error for simplicity
+		return 0, http.ErrMissingFile
 	}
 	return strconv.ParseInt(chatIDStr, 10, 64)
 }
