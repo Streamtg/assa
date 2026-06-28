@@ -72,7 +72,7 @@ func retryWithBackoff(ctx context.Context, max int, base, maxDelay time.Duration
 // PINGGY TUNNEL
 // =============================================================================
 
-var urlRegex = regexp.MustCompile(`https?://[a-zA-Z0-9\-]+\.a\.pinggy\.[a-z]+`)
+var urlRegex = regexp.MustCompile(`https?://[a-zA-Z0-9\-]+\.pinggy\.[a-z]+`)
 
 type Tunnel struct {
 	cmd      *exec.Cmd
