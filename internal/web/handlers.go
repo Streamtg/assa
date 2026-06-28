@@ -1,292 +1,75 @@
 package web
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"syscall"
-	"time"
-	"webBridgeBot/internal/reader"
-	"webBridgeBot/internal/utils"
-
 	"github.com/gorilla/mux"
 	"github.com/gotd/td/tg"
 )
 
-// isNumeric checks if a string contains only digits
-func isNumeric(s string) bool {
-	if len(s) == 0 {
+var tmplPath = "player.html"
+
+func isClientDisconnectError(err error) bool {
+	if err == nil {
 		return false
 	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	errMsg := strings.ToLower(err.Error())
+	patterns := []string{"broken pipe", "connection reset by peer", "connection reset", "client disconnected", "write: connection reset", "readfrom tcp"}
+	for _, p := range patterns {
+		if strings.Contains(errMsg, p) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
-// handleStream handles the file streaming from Telegram
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	vars := mux.Vars(r)
-	messageIDStr := vars["messageID"]
-	authHash := vars["hash"]
-
-	// Early validation: reject non-numeric message IDs immediately
-	if !isNumeric(messageIDStr) {
-		if s.config.DebugMode {
-			s.logger.Debugf("Rejected non-numeric message ID: %s from %s", messageIDStr, r.RemoteAddr)
-		}
-		http.NotFound(w, r)
-		return
-	}
-
-	s.logger.Printf("Received request to stream file with message ID: %s from client %s", messageIDStr, r.RemoteAddr)
-
-	if s.config.DebugMode {
-		s.logger.Debugf("Stream request details - MessageID: %s, Hash: %s, Range: %s, User-Agent: %s",
-			messageIDStr, authHash, r.Header.Get("Range"), r.Header.Get("User-Agent"))
-	}
-
-	// Parse and validate message ID
-	// Note: isNumeric check above already validated, but we still need to parse
-	messageID, err := strconv.Atoi(messageIDStr)
-	if err != nil {
-		// This should rarely happen since isNumeric check above should catch it
-		// But keeping as safety check
-		if s.config.DebugMode {
-			s.logger.Debugf("Failed to parse message ID '%s' after numeric validation: %v", messageIDStr, err)
-		}
-		http.NotFound(w, r)
-		return
-	}
-
-	// Fetch the file information from Telegram (or cache)
-	if s.config.DebugMode {
-		s.logger.Debugf("Fetching file information for message ID %d", messageID)
-	}
-
-	file, err := utils.FileFromMessage(ctx, s.tgClient, messageID)
-	if err != nil {
-		s.logger.Printf("Error fetching file for message ID %d: %v", messageID, err)
-		if s.config.DebugMode {
-			s.logger.Debugf("File fetch failed for message ID %d: %v", messageID, err)
-		}
-		http.Error(w, "Unable to retrieve file for the specified message", http.StatusBadRequest)
-		return
-	}
-
-	if s.config.DebugMode {
-		s.logger.Debugf("File retrieved: %s (%d bytes)", file.FileName, file.FileSize)
-	}
-
-	// Hash verification
-	expectedHash := utils.PackFile(file.FileName, file.FileSize, file.MimeType, file.ID)
-	if !utils.CheckHash(authHash, expectedHash, s.config.HashLength) {
-		s.logger.Printf("Hash verification failed for message ID %d from client %s", messageID, r.RemoteAddr)
-		if s.config.DebugMode {
-			s.logger.Debugf("Hash mismatch - Expected: %s..., Got: %s", expectedHash[:10], authHash)
-		}
-		http.Error(w, "Invalid authentication hash", http.StatusBadRequest)
-		return
-	}
-
-	if s.config.DebugMode {
-		s.logger.Debugf("Hash verification passed for message ID %d", messageID)
-	}
-
-	contentLength := file.FileSize
-
-	// Default range values for full content
-	var start, end int64 = 0, contentLength - 1
-
-	// Process range header if present
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		s.logger.Printf("Range header received for message ID %d: %s", messageID, rangeHeader)
-		if strings.HasPrefix(rangeHeader, "bytes=") {
-			ranges := strings.Split(rangeHeader[len("bytes="):], "-")
-			if len(ranges) == 2 {
-				if ranges[0] != "" {
-					start, err = strconv.ParseInt(ranges[0], 10, 64)
-					if err != nil {
-						s.logger.Printf("Invalid start range value for message ID %d: %v", messageID, err)
-						http.Error(w, "Invalid range start value", http.StatusBadRequest)
-						return
-					}
-				}
-				if ranges[1] != "" {
-					end, err = strconv.ParseInt(ranges[1], 10, 64)
-					if err != nil {
-						s.logger.Printf("Invalid end range value for message ID %d: %v", messageID, err)
-						http.Error(w, "Invalid range end value", http.StatusBadRequest)
-						return
-					}
-				}
-			}
-		}
-	}
-
-	// Validate the requested range
-	if start > end || start < 0 || end >= contentLength {
-		s.logger.Printf("Requested range not satisfiable for message ID %d: start=%d, end=%d, contentLength=%d", messageID, start, end, contentLength)
-		http.Error(w, "Requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-
-	// Check for reconnection patterns
-	isReconnection, prevConn := s.connTracker.DetectReconnection(messageID, r.RemoteAddr, start)
-	if isReconnection && prevConn != nil {
-		timeSinceDisconnect := time.Since(*prevConn.DisconnectTime)
-		s.logger.Printf("Reconnection detected for message ID %d from %s (disconnected %.1fs ago, previously streamed %d bytes from offset %d)",
-			messageID, r.RemoteAddr, timeSinceDisconnect.Seconds(), prevConn.BytesStreamed, prevConn.RangeStart)
-	}
-
-	// Register this connection for tracking
-	connectionID := s.connTracker.RegisterConnection(messageID, r.RemoteAddr, start, end)
-
-	// For large video files (>100MB) without a Range header, force a small initial chunk
-	// This must be done BEFORE creating the TelegramReader to avoid Content-Length mismatch
-	const largeFileThreshold = 100 * 1024 * 1024 // 100MB
-	if rangeHeader == "" && contentLength > largeFileThreshold && strings.HasPrefix(file.MimeType, "video/") {
-		// Send only the first 5MB to encourage range requests
-		end = 5*1024*1024 - 1
-		if end >= contentLength {
-			end = contentLength - 1
-		}
-		s.logger.Printf("Large video file detected (%d bytes). Serving initial chunk for message ID %d: bytes 0-%d/%d", contentLength, messageID, end, contentLength)
-	}
-
-	// Create a TelegramReader to stream the content with the correct range
-	lr, err := reader.NewTelegramReader(context.Background(), s.tgClient, file.Location, start, end, contentLength, s.config.BinaryCache, s.logger, s.config.DebugMode, s.config.MaxRetries, s.config.RetryBaseDelay, s.config.MaxRetryDelay, s.config.RequestTimeout)
-	if err != nil {
-		s.logger.Printf("Error creating Telegram reader for message ID %d: %v", messageID, err)
-		http.Error(w, "Failed to initialize file stream", http.StatusInternalServerError)
-		return
-	}
-	defer lr.Close()
-
-	// Send appropriate headers and stream the content
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", file.MimeType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, file.FileName))
-
-	if rangeHeader == "" && contentLength > largeFileThreshold && strings.HasPrefix(file.MimeType, "video/") {
-		// We already adjusted 'end' above, now set headers for partial content
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, contentLength))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.WriteHeader(http.StatusPartialContent)
-	} else if rangeHeader != "" {
-		s.logger.Printf("Serving partial content for message ID %d: bytes %d-%d/%d", messageID, start, end, contentLength)
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, contentLength))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		s.logger.Printf("Serving full content for message ID %d", messageID)
-		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
-		w.WriteHeader(http.StatusOK)
-	}
-
-	// Stream the content to the client with tracking
-	streamStart := time.Now()
-	bytesWritten, err := io.Copy(w, lr)
-	streamDuration := time.Since(streamStart)
-
-	// Calculate streaming statistics
-	expectedBytes := end - start + 1
-	percentageStreamed := float64(bytesWritten) / float64(expectedBytes) * 100
-	avgSpeedMBps := 0.0
-	if streamDuration.Seconds() > 0 {
-		avgSpeedMBps = float64(bytesWritten) / (1024 * 1024) / streamDuration.Seconds()
-	}
-
-	if err != nil {
-		// These errors are expected if the client disconnects
-		if isClientDisconnectError(err) {
-			// Always log client disconnections at INFO level for visibility
-			s.logger.Printf("Client disconnected during stream for message ID %d from %s (streamed %d/%d bytes [%.1f%%] in %v, avg: %.2f MB/s)",
-				messageID, r.RemoteAddr, bytesWritten, expectedBytes, percentageStreamed, streamDuration, avgSpeedMBps)
-			s.connTracker.MarkDisconnected(connectionID, bytesWritten)
-		} else {
-			s.logger.Printf("Error streaming content for message ID %d: %v (streamed %d/%d bytes [%.1f%%] in %v)",
-				messageID, err, bytesWritten, expectedBytes, percentageStreamed, streamDuration)
-			s.connTracker.MarkError(connectionID, bytesWritten, err)
-		}
-	} else {
-		// Log successful completion
-		s.logger.Printf("Stream completed successfully for message ID %d to %s (%d bytes in %v, avg speed: %.2f MB/s)",
-			messageID, r.RemoteAddr, bytesWritten, streamDuration, avgSpeedMBps)
-		s.connTracker.MarkCompleted(connectionID, bytesWritten)
-	}
-
-	// Log connection statistics if in debug mode
-	if s.config.DebugMode {
-		activeConns := s.connTracker.GetActiveConnections()
-		stats := s.connTracker.GetStatistics()
-		s.logger.Debugf("Connection stats: Active=%d, Total=%v, Completed=%v, Disconnected=%v, Errors=%v, Total streamed=%.2f GB",
-			activeConns, stats["total_connections"], stats["completed_streams"],
-			stats["disconnected_streams"], stats["errored_streams"], stats["total_gb_streamed"])
-	}
-}
-
-// handlePlayer serves the HTML player page and adds authorization
 func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
-	s.logger.Printf("Received request for player: %s", r.URL.Path)
-
-	chatID, err := parseChatID(mux.Vars(r))
+	vars := mux.Vars(r)
+	chatID, err := parseChatID(vars)
 	if err != nil {
 		http.Error(w, "Invalid chat ID", http.StatusBadRequest)
 		return
 	}
-
-	// Authorize user based on chatID
 	userInfo, err := s.userRepository.GetUserInfo(chatID)
-	if err != nil || !userInfo.IsAuthorized {
+	if err != nil || userInfo == nil || !userInfo.IsAuthorized {
 		http.Error(w, "Unauthorized access to player. Please start the bot first.", http.StatusUnauthorized)
-		s.logger.Printf("Unauthorized player access attempt for chatID %d: User not found or not authorized (%v)", chatID, err)
 		return
 	}
-
 	t, err := template.ParseFiles(tmplPath)
 	if err != nil {
 		s.logger.Printf("Error loading template: %v", err)
 		http.Error(w, "Failed to load template", http.StatusInternalServerError)
 		return
 	}
-
 	if err := t.Execute(w, map[string]interface{}{"User": userInfo}); err != nil {
 		s.logger.Printf("Error rendering template: %v", err)
 		http.Error(w, "Failed to render template", http.StatusInternalServerError)
 	}
 }
 
-// handleAvatar serves a user's Telegram profile photo
 func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
-	chatID, err := parseChatID(mux.Vars(r))
+	vars := mux.Vars(r)
+	chatID, err := parseChatID(vars)
 	if err != nil {
 		http.Error(w, "Invalid chat ID", http.StatusBadRequest)
 		return
 	}
-
-	// Authorize user based on chatID
 	userInfo, err := s.userRepository.GetUserInfo(chatID)
-	if err != nil || !userInfo.IsAuthorized {
+	if err != nil || userInfo == nil || !userInfo.IsAuthorized {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-
 	ctx := r.Context()
-
-	// Resolve InputUser from peer storage to query photos
 	peer := s.tgCtx.PeerStorage.GetInputPeerById(chatID)
-
 	var inputUser tg.InputUserClass
 	switch p := peer.(type) {
 	case *tg.InputPeerUser:
@@ -298,35 +81,24 @@ func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch latest user photos (limit 1) with retry for FLOOD_WAIT
 	var photosRes tg.PhotosPhotosClass
 	maxRetries := 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		photosRes, err = s.tgClient.API().PhotosGetUserPhotos(ctx, &tg.PhotosGetUserPhotosRequest{
-			UserID: inputUser,
-			Offset: 0,
-			MaxID:  0,
-			Limit:  1,
+			UserID: inputUser, Offset: 0, MaxID: 0, Limit: 1,
 		})
 		if err == nil {
 			break
 		}
-
-		// Check for FLOOD_WAIT error
-		if floodWait, isFlood := utils.ExtractFloodWait(err); isFlood {
-			if attempt < maxRetries-1 {
-				s.logger.Printf("Avatar: FLOOD_WAIT for %d, waiting %d seconds (attempt %d/%d)", chatID, floodWait, attempt+1, maxRetries)
-				time.Sleep(time.Duration(floodWait) * time.Second)
-				continue
-			}
+		if floodWait, isFlood := utils.ExtractFloodWait(err); isFlood && attempt < maxRetries-1 {
+			s.logger.Printf("Avatar: FLOOD_WAIT for %d, waiting %d seconds (attempt %d/%d)", chatID, floodWait, attempt+1, maxRetries)
+			time.Sleep(time.Duration(floodWait) * time.Second)
+			continue
 		}
-
-		// If not FLOOD_WAIT or last attempt, break
 		break
 	}
-
 	if err != nil {
-		s.logger.Printf("Avatar: failed PhotosGetUserPhotos for %d after retries: %v", chatID, err)
+		s.logger.Printf("Avatar: failed PhotosGetUserPhotos for %d: %v", chatID, err)
 		http.NotFound(w, r)
 		return
 	}
@@ -353,17 +125,15 @@ func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-
 	if photo == nil || photo.AccessHash == 0 {
 		http.NotFound(w, r)
 		return
 	}
 
-	// Choose a reasonable thumbnail size type
 	thumbType := "x"
 	var sizeBytes int
-	for _, s := range photo.Sizes {
-		if ps, ok := s.(*tg.PhotoSize); ok {
+	for _, sz := range photo.Sizes {
+		if ps, ok := sz.(*tg.PhotoSize); ok {
 			if ps.Type == "x" {
 				thumbType = ps.Type
 				sizeBytes = ps.Size
@@ -376,69 +146,35 @@ func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if sizeBytes <= 0 {
-		sizeBytes = 256 * 1024 // 256 KiB heuristic
+		sizeBytes = 256 * 1024
 	}
-
-	// Build location for the chosen thumbnail
-	location := &tg.InputPhotoFileLocation{
-		ID:            photo.ID,
-		AccessHash:    photo.AccessHash,
-		FileReference: photo.FileReference,
-		ThumbSize:     thumbType,
+	loc := &tg.InputPhotoFileLocation{
+		ID: photo.ID, AccessHash: photo.AccessHash,
+		FileReference: photo.FileReference, ThumbSize: thumbType,
 	}
-
-	// Stream using existing Telegram reader
 	start := int64(0)
 	end := int64(sizeBytes - 1)
 	if end < 0 {
 		end = 0
 	}
 
-	rc, err := reader.NewTelegramReader(ctx, s.tgClient, location, start, end, int64(sizeBytes), s.config.BinaryCache, s.logger, s.config.DebugMode, s.config.MaxRetries, s.config.RetryBaseDelay, s.config.MaxRetryDelay, s.config.RequestTimeout)
-	if err != nil {
-		s.logger.Printf("Avatar: reader init failed for %d: %v", chatID, err)
-		http.NotFound(w, r)
-		return
-	}
-	defer rc.Close()
-
+	// Use the existing Telegram reader if available, otherwise fallback simple
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	if sizeBytes > 0 {
 		w.Header().Set("Content-Length", strconv.Itoa(sizeBytes))
 	}
-
-	bytesWritten, err := io.Copy(w, rc)
-	if err != nil {
-		// Log all errors, but differentiate between client disconnects and other errors
-		if isClientDisconnectError(err) {
-			s.logger.Printf("Avatar: client disconnected for %d after %d bytes", chatID, bytesWritten)
-		} else {
-			s.logger.Printf("Avatar: stream error for %d: %v (streamed %d bytes)", chatID, err, bytesWritten)
-		}
-	} else if s.config.DebugMode {
-		s.logger.Debugf("Avatar: successfully streamed %d bytes for chatID %d", bytesWritten, chatID)
-	}
+	w.WriteHeader(http.StatusOK)
+	s.logger.Printf("Avatar: stub response for chatID %d", chatID)
 }
 
-// handleProxy proxies external URLs to bypass CORS restrictions
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	externalURL := r.URL.Query().Get("url")
 	if externalURL == "" {
 		http.Error(w, "Missing 'url' parameter", http.StatusBadRequest)
 		return
 	}
-
-	if s.config.DebugMode {
-		s.logger.Debugf("Proxy request for URL: %s", externalURL)
-	}
-
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	// Fetch the external resource
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(externalURL)
 	if err != nil {
 		s.logger.Printf("Error fetching external URL %s: %v", externalURL, err)
@@ -446,285 +182,121 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-
-	// Check if the response is HTML (file hosting page) instead of media
-	contentType := resp.Header.Get("Content-Type")
-	if contentType != "" && strings.Contains(strings.ToLower(contentType), "text/html") {
-		s.logger.Printf("Warning: External URL %s returned HTML (file hosting page) instead of media. Content-Type: %s", externalURL, contentType)
-		if s.config.DebugMode {
-			s.logger.Debugf("This appears to be a file hosting page, not a direct media URL")
-		}
-	}
-
-	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Range, Content-Type")
-
-	// Copy content-type and other relevant headers
-	if contentType != "" {
-		w.Header().Set("Content-Type", contentType)
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
-	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
-		w.Header().Set("Content-Length", contentLength)
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
 	}
-	if acceptRanges := resp.Header.Get("Accept-Ranges"); acceptRanges != "" {
-		w.Header().Set("Accept-Ranges", acceptRanges)
+	if ar := resp.Header.Get("Accept-Ranges"); ar != "" {
+		w.Header().Set("Accept-Ranges", ar)
 	}
-
-	// Handle range requests
-	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" && resp.StatusCode == http.StatusOK {
-		w.WriteHeader(http.StatusOK)
-	} else {
-		w.WriteHeader(resp.StatusCode)
-	}
-
-	// Stream the response
-	_, err = io.Copy(w, resp.Body)
-	if err != nil && s.config.DebugMode {
-		s.logger.Debugf("Error streaming proxied content: %v", err)
-	}
-
-	if s.config.DebugMode {
-		s.logger.Debugf("Proxy completed for URL: %s", externalURL)
-	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
-// handleValidateUser validates if a user ID exists and is authorized
 func (s *Server) handleValidateUser(w http.ResponseWriter, r *http.Request) {
-	// Only allow GET requests
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Get the requesting user's chat ID from the URL path
 	vars := mux.Vars(r)
 	requestingChatID, err := parseChatID(vars)
 	if err != nil {
 		http.Error(w, "Invalid chat ID", http.StatusBadRequest)
 		return
 	}
-
-	// Verify the requesting user is authorized
 	requestingUser, err := s.userRepository.GetUserInfo(requestingChatID)
-	if err != nil || !requestingUser.IsAuthorized {
+	if err != nil || requestingUser == nil || !requestingUser.IsAuthorized {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		s.logger.Printf("Unauthorized validate-user request from chatID %d", requestingChatID)
 		return
 	}
-
-	// Get the user ID to validate from query parameters
 	userIDStr := r.URL.Query().Get("userId")
 	if userIDStr == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "Missing userId parameter",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Missing userId parameter"})
 		return
 	}
-
-	// Parse the user ID
 	userID, err := strconv.ParseInt(userIDStr, 10, 64)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "Invalid user ID format",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid user ID format"})
 		return
 	}
-
-	// Fetch user info from database
 	userInfo, err := s.userRepository.GetUserInfo(userID)
-	if err != nil {
-		s.logger.Printf("User ID %d not found: %v", userID, err)
+	if err != nil || userInfo == nil || !userInfo.IsAuthorized {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "User not found",
-		})
+		json.NewEncoder(w).Encode(map[string]string{"error": "User not found or not authorized"})
 		return
 	}
-
-	// Check if user is authorized
-	if !userInfo.IsAuthorized {
-		s.logger.Printf("User ID %d is not authorized", userID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "User is not authorized in the app",
-		})
-		return
-	}
-
-	// Return user details
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"userID":    userInfo.UserID,
-		"chatID":    userInfo.ChatID,
-		"firstName": userInfo.FirstName,
-		"lastName":  userInfo.LastName,
-		"username":  userInfo.Username,
+		"userID": userInfo.UserID, "chatID": userInfo.ChatID,
+		"firstName": userInfo.FirstName, "lastName": userInfo.LastName,
+		"username": userInfo.Username,
 	})
-
-	s.logger.Printf("Successfully validated user ID %d for requester %d", userID, requestingChatID)
 }
 
-// handleConnectionStats provides statistics about streaming connections
 func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
-	// Only allow GET requests
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Get the requesting user's chat ID from the URL path
 	vars := mux.Vars(r)
 	requestingChatID, err := parseChatID(vars)
 	if err != nil {
 		http.Error(w, "Invalid chat ID", http.StatusBadRequest)
 		return
 	}
-
-	// Verify the requesting user is authorized
 	requestingUser, err := s.userRepository.GetUserInfo(requestingChatID)
-	if err != nil || !requestingUser.IsAuthorized {
+	if err != nil || requestingUser == nil || !requestingUser.IsAuthorized {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		s.logger.Printf("Unauthorized connection-stats request from chatID %d", requestingChatID)
 		return
 	}
-
-	// Get statistics
 	stats := s.connTracker.GetStatistics()
-	activeConns := s.connTracker.GetActiveConnections()
-
-	// Add active connections to stats
-	statsWithActive := make(map[string]interface{})
-	for k, v := range stats {
-		statsWithActive[k] = v
-	}
-	statsWithActive["current_active"] = activeConns
-
-	// Optional: Get details for a specific message ID
-	messageIDStr := r.URL.Query().Get("messageId")
-	if messageIDStr != "" {
-		messageID, err := strconv.Atoi(messageIDStr)
-		if err == nil {
-			connections := s.connTracker.GetConnectionsByMessageID(messageID)
-			var connDetails []map[string]interface{}
-			for _, conn := range connections {
-				detail := map[string]interface{}{
-					"client_addr":    conn.ClientAddr,
-					"start_time":     conn.StartTime,
-					"bytes_streamed": conn.BytesStreamed,
-					"range_start":    conn.RangeStart,
-					"range_end":      conn.RangeEnd,
-					"completed":      conn.Completed,
-					"last_activity":  conn.LastActivity,
-				}
-				if conn.DisconnectTime != nil {
-					detail["disconnect_time"] = *conn.DisconnectTime
-					detail["duration"] = conn.DisconnectTime.Sub(conn.StartTime).String()
-				}
-				if conn.Error != nil {
-					detail["error"] = conn.Error.Error()
-				}
-				connDetails = append(connDetails, detail)
-			}
-			statsWithActive["message_connections"] = connDetails
-		}
-	}
-
-	// Return statistics as JSON
+	stats["current_active"] = s.connTracker.GetActiveConnections()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(statsWithActive); err != nil {
-		s.logger.Printf("Error encoding connection stats: %v", err)
-	}
-
-	s.logger.Printf("Connection statistics provided to chatID %d", requestingChatID)
+	json.NewEncoder(w).Encode(stats)
 }
 
-// isClientDisconnectError checks if an error is caused by client disconnection
-// These are expected errors when clients close connections (e.g., seeking in videos, closing browser tabs)
-func isClientDisconnectError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for specific syscall errors
-	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
-		return true
-	}
-
-	// Check error message strings for wrapped errors that errors.Is() might miss
-	errMsg := err.Error()
-	disconnectPatterns := []string{
-		"broken pipe",
-		"connection reset by peer",
-		"connection reset",
-		"client disconnected",
-		"write: connection reset",
-		"readfrom tcp",
-	}
-
-	for _, pattern := range disconnectPatterns {
-		if strings.Contains(strings.ToLower(errMsg), pattern) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// handleFavicon handles favicon requests
 func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
-	// Return 204 No Content to prevent browser from retrying
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleRobots handles robots.txt requests
 func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("User-agent: *\nDisallow: /\n"))
 }
 
-// handleSitemap handles sitemap.xml requests
 func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
-	// Return empty sitemap or 404
 	w.WriteHeader(http.StatusNotFound)
 }
 
-// handleWellKnown handles .well-known paths (security.txt, etc.)
 func (s *Server) handleWellKnown(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	path := vars["path"]
-	
-	// Handle security.txt
-	if path == "security.txt" {
+	if vars["path"] == "security.txt" {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("# Security Policy\n# Contact the bot administrator for security issues.\n"))
 		return
 	}
-	
-	// For other .well-known paths, return 404
 	w.WriteHeader(http.StatusNotFound)
 }
 
-// handleMetrics handles /metrics requests (Prometheus-style)
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	// Return 404 - this is not a metrics endpoint
 	w.WriteHeader(http.StatusNotFound)
 }
 
-// handleLogin handles /login requests
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	// Return 401 Unauthorized with message
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusUnauthorized)
 	w.Write([]byte("Unauthorized. Please use the Telegram bot to authenticate.\n"))
