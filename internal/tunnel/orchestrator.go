@@ -18,7 +18,6 @@ import (
 	"time"
 )
 
-// Config agrupa todo lo necesario para el túnel y Cloudflare.
 type Config struct {
 	PinggyUser           string
 	PinggyTarget         string
@@ -33,7 +32,7 @@ type Config struct {
 }
 
 // =============================================================================
-// BACKOFF EXPONENCIAL
+// BACKOFF
 // =============================================================================
 
 func backoff(attempt int, base, max time.Duration) time.Duration {
@@ -69,7 +68,7 @@ func retryWithBackoff(ctx context.Context, max int, base, maxDelay time.Duration
 }
 
 // =============================================================================
-// PINGGY TUNNEL
+// PINGGY
 // =============================================================================
 
 var urlRegex = regexp.MustCompile(`https?://[a-zA-Z0-9\-]+\.pinggy\.[a-z]+`)
@@ -99,7 +98,6 @@ func startTunnel(ctx context.Context, cfg Config) (*Tunnel, error) {
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "LogLevel=ERROR",
-		"-o", "UserKnownHostsFile=/dev/null",
 		cfg.PinggyUser,
 	}
 
@@ -108,16 +106,9 @@ func startTunnel(ctx context.Context, cfg Config) (*Tunnel, error) {
 	}
 
 	t.cmd = exec.CommandContext(tunnelCtx, "ssh", sshArgs...)
-	stdout, err := t.cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := t.cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("stderr pipe: %w", err)
-	}
+
+	stdout, _ := t.cmd.StdoutPipe()
+	stderr, _ := t.cmd.StderrPipe()
 
 	if err := t.cmd.Start(); err != nil {
 		cancel()
@@ -132,12 +123,12 @@ func startTunnel(ctx context.Context, cfg Config) (*Tunnel, error) {
 		t.mu.Lock()
 		t.url = url
 		t.mu.Unlock()
-		log.Printf("[tunnel] activo: %s", url)
+		log.Printf("[tunnel] ✅ Túnel activo: %s", url)
 		go t.wait()
 		return t, nil
 	case <-time.After(45 * time.Second):
 		t.Stop()
-		return nil, fmt.Errorf("timeout esperando URL de pinggy")
+		return nil, fmt.Errorf("timeout esperando URL de Pinggy")
 	case <-tunnelCtx.Done():
 		t.Stop()
 		return nil, ctx.Err()
@@ -154,36 +145,20 @@ func (t *Tunnel) scan(r io.Reader, label string) {
 			default:
 			}
 		}
-		if strings.Contains(line, "pinggy") || strings.Contains(line, "http") || urlRegex.MatchString(line) {
-			log.Printf("[tunnel:%s] %s", label, line)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("[tunnel:%s] scanner error: %v", label, err)
 	}
 }
 
 func (t *Tunnel) wait() {
-	if t.cmd == nil {
-		return
+	if t.cmd != nil {
+		t.cmd.Wait()
 	}
-	err := t.cmd.Wait()
 	close(t.done)
-	if err != nil && t.cmd.ProcessState != nil && !t.cmd.ProcessState.Success() {
-		log.Printf("[tunnel] ssh terminó: %v", err)
-	}
 }
 
 func (t *Tunnel) Stop() {
 	t.cancel()
 	if t.cmd != nil && t.cmd.Process != nil {
-		_ = t.cmd.Process.Signal(syscall.SIGTERM)
-		go func() {
-			<-time.After(5 * time.Second)
-			if t.cmd != nil && t.cmd.Process != nil {
-				_ = t.cmd.Process.Kill()
-			}
-		}()
+		t.cmd.Process.Signal(syscall.SIGTERM)
 	}
 	<-t.done
 }
@@ -194,12 +169,8 @@ func (t *Tunnel) URL() string {
 	return t.url
 }
 
-func (t *Tunnel) Done() <-chan struct{} {
-	return t.done
-}
-
 // =============================================================================
-// CLOUDFLARE API
+// CLOUDFLARE
 // =============================================================================
 
 type cfClient struct {
@@ -210,81 +181,51 @@ type cfClient struct {
 
 func newCFClient(token, account string) *cfClient {
 	return &cfClient{
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    &http.Client{Timeout: 40 * time.Second},
 		token:   token,
 		account: account,
 	}
 }
 
-func (c *cfClient) uploadWorker(ctx context.Context, scriptName, content string) error {
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/workers/scripts/%s", c.account, scriptName)
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, strings.NewReader(content))
-	if err != nil {
-		return err
-	}
+func (c *cfClient) uploadWorker(ctx context.Context, name, content string) error {
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/workers/scripts/%s", c.account, name)
+
+	req, _ := http.NewRequestWithContext(ctx, "PUT", url, strings.NewReader(content))
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/javascript")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("Cloudflare error %d: %s", resp.StatusCode, string(body))
 	}
 
-	var envelope struct {
-		Success bool `json:"success"`
-		Errors  []struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &envelope); err == nil {
-		if !envelope.Success {
-			return fmt.Errorf("cf api errors: %+v", envelope.Errors)
-		}
-	}
-
-	log.Printf("[cloudflare] worker '%s' actualizado (HTTP %d)", scriptName, resp.StatusCode)
+	log.Printf("[cloudflare] ✅ Worker '%s' actualizado correctamente", name)
 	return nil
 }
 
 // =============================================================================
-// ORQUESTADOR PRINCIPAL
+// ORQUESTADOR PRINCIPAL (VERSIÓN MEJORADA)
 // =============================================================================
 
 func Run(ctx context.Context, cfg Config) error {
-	var template []byte
+	var templateContent []byte
 	var err error
 
 	if cfg.CFWorkerTemplatePath != "" {
-		template, err = os.ReadFile(cfg.CFWorkerTemplatePath)
+		templateContent, err = os.ReadFile(cfg.CFWorkerTemplatePath)
 		if err != nil {
-			return fmt.Errorf("read worker template: %w", err)
+			return fmt.Errorf("no se pudo leer el template del worker: %w", err)
 		}
+		log.Printf("[tunnel] Usando template: %s", cfg.CFWorkerTemplatePath)
 	} else {
-		template = []byte(`const ORIGIN_URL = '__PINGGY_URL__';
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const target = new URL(url.pathname + url.search, ORIGIN_URL);
-    const modifiedRequest = new Request(target, {
-      method: request.method,
-      headers: request.headers,
-      body: request.body,
-      redirect: request.redirect,
-    });
-    try {
-      return await fetch(modifiedRequest);
-    } catch (err) {
-      return new Response('Origin error: ' + err.message, {status: 502});
-    }
-  }
-};`)
+		// Template mínimo de respaldo
+		templateContent = []byte(`const UPSTREAM_ORIGIN = '__PINGGY_URL__';` + "\n" + `addEventListener('fetch', event => { event.respondWith(handleRequest(event.request)); }); async function handleRequest(request) { const url = new URL(request.url); const target = new URL(url.pathname + url.search, UPSTREAM_ORIGIN); return fetch(target, request); }`)
 	}
 
 	cf := newCFClient(cfg.CFAPIToken, cfg.CFAccountID)
@@ -298,39 +239,36 @@ export default {
 
 		var tunnel *Tunnel
 		err := retryWithBackoff(ctx, cfg.MaxRetries, cfg.RetryBaseDelay, 5*time.Minute, func() error {
-			var err error
-			tunnel, err = startTunnel(ctx, cfg)
-			return err
+			var e error
+			tunnel, e = startTunnel(ctx, cfg)
+			return e
 		})
 		if err != nil {
-			log.Printf("[orchestrator] fallo al iniciar túnel: %v. Esperando 1m...", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Minute):
-				continue
-			}
+			log.Printf("[tunnel] Error iniciando túnel: %v. Reintentando en 60s...", err)
+			time.Sleep(60 * time.Second)
+			continue
 		}
 
-		url := tunnel.URL()
-		if url == "" {
-			log.Println("[orchestrator] URL vacía, reiniciando ciclo...")
+		pinggyURL := tunnel.URL()
+		if pinggyURL == "" {
 			tunnel.Stop()
 			continue
 		}
 
-		code := strings.ReplaceAll(string(template), "__PINGGY_URL__", url)
-		code = strings.ReplaceAll(code, "{{PINGGY_URL}}", url)
-		code = strings.ReplaceAll(code, "${PINGGY_URL}", url)
+		// Reemplazar placeholder en el worker
+		workerCode := strings.ReplaceAll(string(templateContent), "__PINGGY_URL__", pinggyURL)
+		workerCode = strings.ReplaceAll(workerCode, "{{PINGGY_URL}}", pinggyURL)
 
 		err = retryWithBackoff(ctx, cfg.MaxRetries, cfg.RetryBaseDelay, 5*time.Minute, func() error {
-			return cf.uploadWorker(ctx, cfg.CFWorkerName, code)
+			return cf.uploadWorker(ctx, cfg.CFWorkerName, workerCode)
 		})
 		if err != nil {
-			log.Printf("[orchestrator] fallo Cloudflare: %v. Reiniciando túnel...", err)
+			log.Printf("[tunnel] Error subiendo worker: %v", err)
 			tunnel.Stop()
 			continue
 		}
+
+		log.Printf("[tunnel] ✅ Worker actualizado con URL: %s", pinggyURL)
 
 		timer := time.NewTimer(cfg.Lifetime)
 		select {
@@ -339,12 +277,11 @@ export default {
 			tunnel.Stop()
 			return ctx.Err()
 		case <-timer.C:
-			log.Println("[orchestrator] renovación de túnel (60 min). Reiniciando...")
+			log.Println("[tunnel] Renovando túnel...")
 			tunnel.Stop()
-			<-time.After(3 * time.Second)
 		case <-tunnel.Done():
 			timer.Stop()
-			log.Println("[orchestrator] túnel caído inesperadamente. Reconectando...")
+			log.Println("[tunnel] Túnel caído. Reconectando...")
 		}
 	}
 }
