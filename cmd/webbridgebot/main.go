@@ -70,7 +70,7 @@ func main() {
 	rootCmd.Flags().BoolVar(&cfg.DebugMode, "debug_mode", false, "Enable debug logging (default false)")
 	rootCmd.Flags().StringVar(&cfg.LogLevel, "log_level", "INFO", "Log level: DEBUG, INFO, WARNING, ERROR (default INFO, or DEBUG if debug_mode=true)")
 	rootCmd.Flags().StringVar(&cfg.LogChannelID, "log_channel_id", "0", "Optional: Telegram Channel ID or @username to forward all media to (for logging)")
-	rootCmd.Flags().StringVar(&cfg.TunnelUser, "tunnel_user", "BkPJOM3hqWT@pro.pinggy.io", "Pinggy SSH user")
+	rootCmd.Flags().StringVar(&cfg.TunnelUser, "tunnel_user", "a.pinggy.io", "Pinggy SSH host (free version)")
 	rootCmd.Flags().StringVar(&cfg.TunnelTarget, "tunnel_target", "0:127.0.0.1:8080", "Pinggy remote target")
 	rootCmd.Flags().IntVar(&cfg.TunnelSSHPort, "tunnel_ssh_port", 443, "Pinggy SSH port")
 	rootCmd.Flags().DurationVar(&cfg.TunnelLifetime, "tunnel_lifetime", 60*time.Minute, "Tunnel renewal interval")
