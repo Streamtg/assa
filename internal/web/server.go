@@ -25,7 +25,7 @@ type Server struct {
 	fs             *store.FireStore
 	userRepository *UserRepoAdapter
 	connTracker    *ConnTracker
-	wsManager      *WSManager
+	wsManager      *WebSocketManager
 	router         *mux.Router
 }
 
@@ -38,7 +38,7 @@ func NewServer(cfg *config.Configuration, tgClient *gotgproto.Client, tgCtx *ext
 		fs:             fs,
 		userRepository: NewUserRepoAdapter(fs),
 		connTracker:    NewConnTracker(),
-		wsManager:      NewWSManager(),
+		wsManager:      NewWebSocketManager(),
 	}
 	s.router = mux.NewRouter()
 	s.router.HandleFunc("/{hash}/{filename}", s.handleFile).Methods("GET", "HEAD")
@@ -56,7 +56,7 @@ func NewServer(cfg *config.Configuration, tgClient *gotgproto.Client, tgCtx *ext
 	s.router.HandleFunc("/.well-known/{path}", s.handleWellKnown).Methods("GET")
 	s.router.HandleFunc("/metrics", s.handleMetrics).Methods("GET")
 	s.router.HandleFunc("/login", s.handleLogin).Methods("GET")
-	s.router.HandleFunc("/ws", s.wsManager.ServeHTTP)
+	s.router.HandleFunc("/ws/{chatID}", s.handleWebSocket)
 
 	return s
 }
