@@ -244,7 +244,7 @@ func setDefaultValues(cfg *Configuration) {
 		cfg.MaxRetryDelay = 60
 	}
 	if cfg.TunnelUser == "" {
-		cfg.TunnelUser = "BkPJOM3hqWT@pro.pinggy.io"
+		cfg.TunnelUser = "a.pinggy.io"
 	}
 	if cfg.TunnelTarget == "" {
 		cfg.TunnelTarget = "0:127.0.0.1:8080"
